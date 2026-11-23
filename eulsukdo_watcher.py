@@ -4,14 +4,37 @@
 - 수동 실행(Run workflow): 현재 빈 자리 전체 + 진단 정보를 메일로 보냄
 """
 import os, re, json, smtplib
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE = "https://saha-eulsukdogym.kr"
 LOGIN_URL = f"{BASE}/login"
 COURT_URL = f"{BASE}/html/?pCode=7"
 FULL_WORDS = ["예약완료", "마감", "불가"]   # 이 단어가 붙은 시간은 '찬 자리'
 STATE = "seen.json"
+
+
+KST = ZoneInfo("Asia/Seoul")
+WD = "월화수목금토일"
+
+
+def is_upcoming(date, slot):
+    """오늘(한국시간) 이후 일정만. 오늘은 이미 시작한 시간대 제외."""
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return True
+    now = datetime.now(KST)
+    if d > now.date():
+        return True
+    if d < now.date():
+        return False
+    m = re.search(r"(\d{1,2})\D*(\d{2})\s*~", slot)
+    if not m:
+        return True
+    return (int(m.group(1)), int(m.group(2))) > (now.hour, now.minute)
 
 
 def send_mail(subject, body):
@@ -65,7 +88,7 @@ def find_courts(page, diag):
     for n in nums:
         href = ""
         for text, h in items:
-            if re.search(rf"\b{n}\s*번\s*코트", text) and h and not h.endswith("#"):
+            if re.search(rf"\b{n}\s*번\s*코트", text) and h.startswith("http") and not h.endswith("#"):
                 href = h
                 break
         courts[f"{n}번 코트"] = href
@@ -76,13 +99,25 @@ def find_courts(page, diag):
 
 
 def open_court(page, cname, href):
+    """코트 화면을 열고 (사용할 page, 새 창 여부)를 돌려준다."""
     if href:
         page.goto(href)
-    else:
-        page.goto(COURT_URL)
         page.wait_for_load_state("networkidle")
-        page.locator(f"text=/{cname[0]}\\s*번\\s*코트/").first.click()
+        return page, False
+    n = cname[0]
+    page.goto(COURT_URL)
     page.wait_for_load_state("networkidle")
+    link = page.locator("a", has_text=re.compile(rf"{n}\s*번\s*코트")).first
+    try:
+        with page.context.expect_page(timeout=4000) as pi:
+            link.click()
+        newp = pi.value
+        newp.on("dialog", lambda d: d.accept())
+        newp.wait_for_load_state("networkidle")
+        return newp, True
+    except PWTimeout:
+        page.wait_for_load_state("networkidle")
+        return page, False
 
 
 def day_links(page):
@@ -109,38 +144,55 @@ def read_slots(page):
 def scan(page, diag):
     courts = find_courts(page, diag)
     available = {}   # "코트|날짜|시간" -> True
+    total = 0
     for cname, url in courts.items():
+        cp, popped = page, False
         try:
-            open_court(page, cname, url)
+            cp, popped = open_court(page, cname, url)
+            diag.append(f"[{cname}] 열린 주소: {cp.url}")
+            n = day_links(cp).count()
+            seen_dates = 0
+            for i in range(n):
+                try:
+                    day_links(cp).nth(i).click(timeout=3000)
+                    cp.wait_for_timeout(800)
+                    cp.wait_for_load_state("domcontentloaded")
+                    date, free, full = read_slots(cp)
+                except Exception:
+                    continue
+                if not free and not full:
+                    continue
+                seen_dates += 1
+                total += 1
+                for t in free:
+                    if is_upcoming(date, t):
+                        available[f"{cname}|{date}|{t}"] = True
+            diag.append(f"[{cname}] 날짜칸 {n}개, 시간표가 나온 날짜 {seen_dates}개")
         except Exception as e:
-            diag.append(f"[{cname}] 열기 실패: {e}")
-            continue
-        diag.append(f"[{cname}] 열린 주소: {page.url}")
-        n = day_links(page).count()
-        seen_dates = 0
-        for i in range(n):
-            try:
-                day_links(page).nth(i).click(timeout=3000)
-                page.wait_for_timeout(800)
-                page.wait_for_load_state("domcontentloaded")
-                date, free, full = read_slots(page)
-            except Exception:
-                continue
-            if not free and not full:
-                continue
-            seen_dates += 1
-            for t in free:
-                available[f"{cname}|{date}|{t}"] = True
-        diag.append(f"[{cname}] 날짜칸 {n}개, 시간표가 나온 날짜 {seen_dates}개")
-    return available
+            diag.append(f"[{cname}] 실패: {str(e)[:200]}")
+        finally:
+            if popped:
+                cp.close()
+    return available, total
 
 
 def fmt(keys):
-    rows = {}
-    for k in sorted(keys):
+    by_date = {}
+    for k in sorted(keys, key=lambda x: (x.split("|")[1], x.split("|")[0], x.split("|")[2])):
         c, d, t = k.split("|")
-        rows.setdefault((c, d), []).append(t)
-    return "\n".join(f"{c}  {d}  : {', '.join(ts)}" for (c, d), ts in rows.items())
+        by_date.setdefault(d, {}).setdefault(c, []).append(t)
+    out = []
+    for d, courts in sorted(by_date.items()):
+        try:
+            wd = WD[datetime.strptime(d, "%Y-%m-%d").weekday()]
+            head = f"■ {d[5:].replace('-', '/')} ({wd})"
+        except ValueError:
+            head = f"■ {d}"
+        out.append(head)
+        for c, ts in courts.items():
+            out.append(f"   {c}: {', '.join(ts)}")
+        out.append("")
+    return "\n".join(out).strip()
 
 
 def main():
@@ -154,8 +206,10 @@ def main():
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             if login(page, diag):
-                cur = scan(page, diag)
-                ok = True
+                cur, total = scan(page, diag)
+                ok = total > 0   # 시간표를 한 번이라도 읽었을 때만 성공으로 본다
+                if not ok:
+                    diag.append("시간표를 하나도 읽지 못해 이번 결과는 저장하지 않습니다.")
     except Exception as e:
         diag.append(f"오류: {e}")
         print("오류 발생:", type(e).__name__)
@@ -165,7 +219,9 @@ def main():
         new = cur_keys - prev
         if new:
             send_mail("[을숙도 테니스장] 새로 빈 자리가 생겼어요!",
-                      fmt(new) + f"\n\n바로 예약: {COURT_URL}")
+                      "★ 새로 생긴 자리(취소 등)\n" + fmt(new)
+                      + "\n\n──────────\n현재 빈 자리 전체\n" + fmt(cur_keys)
+                      + f"\n\n바로 예약: {COURT_URL}")
             print("새 빈 자리 메일 발송:", len(new))
         else:
             print("새 빈 자리 없음")
@@ -173,7 +229,7 @@ def main():
         print("첫 실행: 현재 상태를 기준으로 저장")
 
     if manual:
-        body = ("현재 빈 자리(전체):\n" + (fmt(cur_keys) or "없음")
+        body = ("현재 빈 자리(오늘 이후):\n" + (fmt(cur_keys) or "없음")
                 + "\n\n--- 진단 ---\n" + "\n\n".join(diag))
         send_mail("[을숙도 감시] 현재 빈 자리 + 진단", body)
         print("진단 메일 발송")
