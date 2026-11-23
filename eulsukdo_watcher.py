@@ -1,5 +1,6 @@
 """
 을숙도 테니스장 빈 자리/취소표 감시 -> Gmail 알림
+- 이번 달 + 다음 달(열려 있는 날짜까지) 확인
 - 자동 실행(5분마다): 새로 생긴 빈 자리(취소 포함)가 있을 때만 메일
 - 수동 실행(Run workflow): 현재 빈 자리 전체 + 진단 정보를 메일로 보냄
 """
@@ -141,6 +142,54 @@ def read_slots(page):
     return date, free, full
 
 
+def cal_month(page):
+    """달력 머리글('2026.11')에서 (년, 월)을 읽는다."""
+    m = re.search(r"(\d{4})\s*\.\s*(\d{1,2})", page.inner_text("body"))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def go_next_month(cp):
+    before = cal_month(cp)
+    try:
+        cp.get_by_text(">", exact=True).first.click(timeout=3000)
+        cp.wait_for_timeout(800)
+        cp.wait_for_load_state("domcontentloaded")
+    except Exception:
+        return False
+    return cal_month(cp) != before
+
+
+def scan_month(cp, cname, available):
+    """지금 보이는 달에서 오늘 이후 날짜를 눌러 빈 시간을 모은다. 시간표가 나온 날짜 수를 돌려준다."""
+    now = datetime.now(KST)
+    ym = cal_month(cp)
+    n = day_links(cp).count()
+    seen = miss = 0
+    for i in range(n):
+        loc = day_links(cp).nth(i)
+        try:
+            num = int(re.sub(r"\D", "", loc.inner_text()))
+            if ym == (now.year, now.month) and num < now.day:
+                continue                      # 지난 날짜는 건너뜀
+            loc.click(timeout=3000)
+            cp.wait_for_timeout(600)
+            cp.wait_for_load_state("domcontentloaded")
+            date, free, full = read_slots(cp)
+        except Exception:
+            continue
+        if not free and not full:
+            miss += 1
+            if seen and miss >= 4:            # 예약이 열린 범위를 지났으면 중단
+                break
+            continue
+        miss = 0
+        seen += 1
+        for t in free:
+            if is_upcoming(date, t):
+                available[f"{cname}|{date}|{t}"] = True
+    return seen
+
+
 def scan(page, diag):
     courts = find_courts(page, diag)
     available = {}   # "코트|날짜|시간" -> True
@@ -150,24 +199,14 @@ def scan(page, diag):
         try:
             cp, popped = open_court(page, cname, url)
             diag.append(f"[{cname}] 열린 주소: {cp.url}")
-            n = day_links(cp).count()
-            seen_dates = 0
-            for i in range(n):
-                try:
-                    day_links(cp).nth(i).click(timeout=3000)
-                    cp.wait_for_timeout(800)
-                    cp.wait_for_load_state("domcontentloaded")
-                    date, free, full = read_slots(cp)
-                except Exception:
-                    continue
-                if not free and not full:
-                    continue
-                seen_dates += 1
-                total += 1
-                for t in free:
-                    if is_upcoming(date, t):
-                        available[f"{cname}|{date}|{t}"] = True
-            diag.append(f"[{cname}] 날짜칸 {n}개, 시간표가 나온 날짜 {seen_dates}개")
+            for step in range(2):             # 이번 달 + 다음 달
+                label = cal_month(cp)
+                seen = scan_month(cp, cname, available)
+                total += seen
+                diag.append(f"[{cname}] {label} : 시간표가 나온 날짜 {seen}개")
+                if step == 0 and not go_next_month(cp):
+                    diag.append(f"[{cname}] 다음 달로 넘어가지 못함")
+                    break
         except Exception as e:
             diag.append(f"[{cname}] 실패: {str(e)[:200]}")
         finally:
