@@ -1,12 +1,7 @@
 """
 을숙도 테니스장 취소표 감시 -> Gmail 알림
-설치:  pip install playwright && playwright install chromium
-실행:  환경변수를 설정한 뒤  python eulsukdo_watcher.py
-  SITE_ID, SITE_PW         예약 사이트 아이디/비밀번호
-  GMAIL_USER               보내는 Gmail 주소
-  GMAIL_APP_PW             Gmail 앱 비밀번호(16자리)
-  MAIL_TO                  받는 주소 (기본: GMAIL_USER)
-  INTERVAL_SEC             조회 간격 초 (기본 120, 너무 짧게 하지 마세요)
+GitHub Actions에서 5분마다 1회 실행됩니다.
+수동 실행(Run workflow)하면 진단 보고서 메일도 보냅니다.
 """
 import os, re, time, smtplib, hashlib
 from email.message import EmailMessage
@@ -15,7 +10,6 @@ from playwright.sync_api import sync_playwright
 BASE = "https://saha-eulsukdogym.kr"
 LOGIN_URL = f"{BASE}/login"
 COURT_URL = f"{BASE}/html/?pCode=7"
-INTERVAL = int(os.environ.get("INTERVAL_SEC", "120"))
 # 빈 자리를 뜻하는 단어들 (사이트 실제 표기에 맞게 수정)
 OPEN_WORDS = ["예약가능", "신청가능", "접수가능", "예약하기", "신청하기"]
 
@@ -39,18 +33,24 @@ def login(page):
     page.wait_for_load_state("networkidle")
 
 
-def scan(page):
+def scan(page, diag):
     """코트 목록 -> 각 코트의 예약 화면에서 '가능' 표시를 찾는다."""
     page.goto(COURT_URL)
     page.wait_for_load_state("networkidle")
-    names = [t.strip() for t in page.locator("text=/을숙도 테니스장 - \\d번 코트/").all_inner_texts()]
+    diag.append(f"현재 주소: {page.url}")
+    body = page.inner_text("body")
+    diag.append("예약 목록 화면 글자(앞 800자):\n" + body[:800])
+    names = [t.strip() for t in page.locator("text=/\\d번 코트/").all_inner_texts()]
+    names = list(dict.fromkeys(names))
+    diag.append(f"찾은 코트 수: {len(names)} -> {names}")
     found = {}
-    for i, name in enumerate(dict.fromkeys(names)):
+    for name in names:
         page.goto(COURT_URL)
         page.wait_for_load_state("networkidle")
         page.locator(f"text={name}").first.click()
         page.wait_for_load_state("networkidle")
         text = page.inner_text("body")
+        diag.append(f"[{name}] 화면 글자(앞 500자):\n" + text[:500])
         hits = [ln.strip() for ln in text.splitlines()
                 if any(w in ln for w in OPEN_WORDS)]
         if hits:
@@ -59,14 +59,22 @@ def scan(page):
 
 
 def main():
-    """GitHub Actions용: 1회만 조회하고 종료. 중복 알림 방지용 상태는 seen.txt에 저장."""
+    """1회 조회 후 종료. 수동 실행이면 진단 메일을 보낸다."""
+    manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     state = "seen.txt"
     prev = open(state).read().strip() if os.path.exists(state) else ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        login(page)
-        found = scan(page)
+    diag = []
+    found = {}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            login(page)
+            diag.append(f"로그인 후 주소: {page.url}")
+            found = scan(page, diag)
+    except Exception as e:
+        diag.append(f"오류: {e}")
+        print("오류 발생:", type(e).__name__)
     lines = sorted(f"[{c}] {h}" for c, hs in found.items() for h in hs)
     key = hashlib.md5("\n".join(lines).encode()).hexdigest() if lines else ""
     if lines and key != prev:
@@ -75,6 +83,9 @@ def main():
         print("메일 발송:", lines)
     else:
         print("변화 없음")
+    if manual:
+        send_mail("[을숙도 감시] 진단 보고서", "\n\n".join(diag) or "정보 없음")
+        print("진단 메일 발송")
     open(state, "w").write(key)
 
 
