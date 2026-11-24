@@ -21,6 +21,7 @@ STATE = "seen.json"
 STATE_VER = 3
 SITE_DIR = "site"
 KST = ZoneInfo("Asia/Seoul")
+WINDOW_DAYS = 7   # 오늘부터 며칠 뒤까지가 실제 예약 가능 범위인지 (바꾸고 싶으면 이 숫자만 수정)
 WD = "월화수목금토일"
 
 
@@ -40,6 +41,16 @@ def date_label(d):
         return f"{d[5:7]}/{d[8:10]}({wd})"
     except ValueError:
         return d
+
+
+def in_window(date):
+    """예약이 실제로 열리는 범위(오늘 ~ 오늘+WINDOW_DAYS일, 한국시간) 안인지"""
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return True
+    today = datetime.now(KST).date()
+    return 0 <= (d - today).days <= WINDOW_DAYS
 
 
 def is_upcoming(date, slot):
@@ -226,7 +237,7 @@ def read_slots(page):
     return date, free, full
 
 
-def scan_month(cp, cname, label, avail, observed):
+def scan_month(cp, cname, label, avail, observed, diag):
     now = datetime.now(KST)
     ym = cal_month(cp)
     n = day_links(cp).count()
@@ -253,6 +264,10 @@ def scan_month(cp, cname, label, avail, observed):
                 break
             continue
         last_date = date
+        if not in_window(date):
+            diag.append(f"[{cname}] {date}부터는 예약 가능 범위(오늘+{WINDOW_DAYS}일) 밖이라 건너뜀 "
+                        f"(그 날 시간표: 빈 {len(free)}개 / 찬 {len(full)}개)")
+            break
         miss = 0
         seen += 1
         for t in free:
@@ -277,7 +292,7 @@ def scan_eulsukdo(page, diag):
             goto_current_month(cp)
             for step in range(2):             # 이번 달 + 다음 달
                 ym = cal_month(cp)
-                seen = scan_month(cp, cname, f"을숙도 {cname}", avail, observed)
+                seen = scan_month(cp, cname, f"을숙도 {cname}", avail, observed, diag)
                 total += seen
                 diag.append(f"[{cname}] {ym} : 시간표가 나온 날짜 {seen}개")
                 if step == 0 and not go_next_month(cp):
@@ -292,6 +307,23 @@ def scan_eulsukdo(page, diag):
 
 
 # ---------- 사직 실내테니스장 ----------
+def goto_retry(page, url, tries=3):
+    last = None
+    for _ in range(tries):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            last = e
+            page.wait_for_timeout(3000)
+    raise last
+
+
+
 def parse_grid(tables):
     """표 목록(행→칸 글자)에서 '코트 번호 머리글'이 있는 표를 찾아 (코트번호, 시간, 칸글자) 목록을 만든다."""
     for trs in tables:
@@ -319,8 +351,7 @@ def parse_grid(tables):
 
 def scan_sajik(page, diag):
     avail, observed, total = set(), set(), 0
-    page.goto(SAJIK_URL)
-    page.wait_for_load_state("networkidle")
+    goto_retry(page, SAJIK_URL)
     if page.locator("input[type=password]:visible").count() > 0:
         diag.append("[사직] 로그인이 필요한 페이지로 보입니다. (비밀번호 입력창이 보임)")
         return avail, observed, 0
