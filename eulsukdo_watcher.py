@@ -97,7 +97,7 @@ def send_mail(subject, body):
         s.send_message(msg)
 
 
-def alert_mail(new_tags):
+def alert_mail(new_tags, avail=()):
     """new_tags: {키: '취소' 또는 '신규 오픈'} -> 시설별로 따로 메일 발송"""
     by_fac = {}
     for k in new_tags:
@@ -114,6 +114,9 @@ def alert_mail(new_tags):
         body = (f"{fac} 테니스장에 예약 가능한 자리가 새로 생겼어요.\n\n"
                 f"{lines}\n\n지금 예약하기: {URLS.get(fac, '')}\n\n"
                 "다른 사람이 먼저 예약할 수 있으니 서둘러 주세요.")
+        cur = {k.replace(f"{fac} ", "", 1) for k in avail if k.startswith(fac + " ")}
+        body += (f"\n\n──────────\n현재 비어 있는 자리 전체 ({fac}, 총 {len(cur)}개)\n\n"
+                 + (fmt(cur) or "없음"))
         send_mail(subject, body)
 
 
@@ -133,6 +136,15 @@ def fmt(keys):
 
 
 # ---------- 사이트 읽기 ----------
+def settle(page, ms=8000):
+    """로딩이 끝날 때까지 최대 ms만 기다리고, 안 끝나도 그냥 진행한다."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=ms)
+    except Exception:
+        pass
+
+
+
 def login(page, diag):
     msgs = []
 
@@ -141,8 +153,8 @@ def login(page, diag):
         d.accept()
 
     page.on("dialog", on_dialog)
-    page.goto(LOGIN_URL)
-    page.wait_for_load_state("networkidle")
+    goto_retry(page, LOGIN_URL, 3)
+    settle(page)
     pw = page.locator("input[type=password]:visible").first
     form = page.locator("form:has(input[type=password]:visible)").first
     idbox = form.locator(
@@ -153,7 +165,7 @@ def login(page, diag):
     pw.fill(os.environ["SITE_PW"])
     pw.press("Enter")
     page.wait_for_timeout(3000)
-    page.wait_for_load_state("networkidle")
+    settle(page)
     ok = page.locator("input[type=password]:visible").count() == 0
     diag.append(f"로그인: {'성공' if ok else '실패(비밀번호 입력창이 아직 보임)'} / 주소 {page.url}")
     if msgs:
@@ -162,8 +174,8 @@ def login(page, diag):
 
 
 def find_courts(page, diag):
-    page.goto(COURT_URL)
-    page.wait_for_load_state("networkidle")
+    goto_retry(page, COURT_URL, 3)
+    settle(page)
     body = page.inner_text("body")
     nums = sorted(set(re.findall(r"(\d+)\s*번\s*코트", body)), key=int)
     courts = {f"{n}번 코트": "" for n in nums}
@@ -174,18 +186,18 @@ def find_courts(page, diag):
 def open_court(page, cname):
     """코트 화면을 열고 (사용할 page, 새 창 여부)를 돌려준다."""
     n = cname[0]
-    page.goto(COURT_URL)
-    page.wait_for_load_state("networkidle")
+    goto_retry(page, COURT_URL, 3)
+    settle(page)
     link = page.locator("a", has_text=re.compile(rf"{n}\s*번\s*코트")).first
     try:
         with page.context.expect_page(timeout=4000) as pi:
             link.click()
         newp = pi.value
         newp.on("dialog", lambda d: d.accept())
-        newp.wait_for_load_state("networkidle")
+        settle(newp)
         return newp, True
     except PWTimeout:
-        page.wait_for_load_state("networkidle")
+        settle(page)
         return page, False
 
 
@@ -206,7 +218,7 @@ def go_next_month(cp):
     try:
         cp.get_by_text(">", exact=True).first.click(timeout=3000)
         cp.wait_for_timeout(800)
-        cp.wait_for_load_state("domcontentloaded")
+        settle(cp, 3000)
     except Exception:
         return False
     return cal_month(cp) != before
@@ -254,7 +266,7 @@ def scan_month(cp, cname, label, avail, observed, diag):
                 continue
             loc.click(timeout=3000)
             cp.wait_for_timeout(600)
-            cp.wait_for_load_state("domcontentloaded")
+            settle(cp, 3000)
             date, free, full = read_slots(cp)
         except Exception:
             continue
@@ -307,11 +319,11 @@ def scan_eulsukdo(page, diag):
 
 
 # ---------- 사직 실내테니스장 ----------
-def goto_retry(page, url, tries=3):
+def goto_retry(page, url, tries=2):
     last = None
     for _ in range(tries):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
@@ -365,7 +377,7 @@ def scan_sajik(page, diag):
         try:
             tabs().nth(i).click(timeout=3000)
             page.wait_for_timeout(800)
-            page.wait_for_load_state("domcontentloaded")
+            settle(page, 3000)
             body = page.inner_text("body")
             dm = re.search(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", body)
             if not dm:
@@ -522,7 +534,7 @@ def main():
             # 전에 시간표에 있었는데(찬 자리였는데) 비었다 = 취소, 처음 보는 시간 = 신규 오픈
             new_tags[k] = "취소" if k in prev_all else "신규 오픈"
         if new_tags:
-            alert_mail(new_tags)
+            alert_mail(new_tags, avail)
             print("새 빈 자리 메일 발송:", len(new_tags))
         else:
             print("새 빈 자리 없음")
